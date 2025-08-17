@@ -17,7 +17,7 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      # Checkout Orchestrator (repo A - chính nó)
+      # Checkout Orchestrator (repo A)
       - uses: actions/checkout@v4
 
       - name: Setup Python
@@ -25,10 +25,10 @@ jobs:
         with:
           python-version: "3.11"
 
-      # Sanity check: token có đọc được Engine repo không?
+      # Kiểm tra token có quyền đọc repo Engine
       - name: Sanity check ENGINE_TOKEN can read Engine repo
         env:
-          ENGINE_REPO: tinsleigh1217650-delv/news2video-engine   # ĐỔI nếu Engine repo của bạn khác
+          ENGINE_REPO: tinsleigh1217650-delv/news2video-engine    # đổi nếu tên khác
           GH_TOKEN: ${{ secrets.ENGINE_TOKEN }}
         run: |
           curl -s -H "Authorization: Bearer $GH_TOKEN" https://api.github.com/repos/$ENGINE_REPO > repo.json
@@ -40,18 +40,18 @@ jobs:
           print("default_branch:", j.get('default_branch'))
           PY
 
-      # Checkout ENGINE (Repo B - Private) vào thư mục engine/
+      # Checkout Engine (repo B - PRIVATE) vào thư mục engine/
       - name: Checkout private engine
         uses: actions/checkout@v4
         with:
-          repository: tinsleigh1217650-delv/news2video-engine   # ĐỔI nếu cần
-          token: ${{ secrets.ENGINE_TOKEN }}                # PAT: Contents: Read
+          repository: tinsleigh1217650-delv/news2video-engine     # đổi nếu cần
+          token: ${{ secrets.ENGINE_TOKEN }}                      # PAT: Contents Read
           path: engine
           ref: main
           fetch-depth: 1
           submodules: false
 
-      # Cache
+      # Cache pip / huggingface / piper
       - name: Cache pip
         uses: actions/cache@v4
         with:
@@ -70,7 +70,7 @@ jobs:
           path: ~/.local/share/piper-tts
           key: ${{ runner.os }}-piper-${{ hashFiles('engine/src/tts_piper_segments.py') }}
 
-      # Deps
+      # System deps + Python deps
       - name: Install system deps
         run: |
           sudo apt-get update
@@ -88,22 +88,23 @@ jobs:
               print("PY DEPS CHECK FAILED:", e); sys.exit(1)
           PY
 
-      # (tuỳ chọn) Debug nhanh
+      # (debug nhẹ)
       - name: Debug list files
         run: |
           pwd
           ls -la
           ls -la engine || true
           ls -la engine/src || true
+          ls -la engine/feeds || true
 
-      # BẮT BUỘC: kiểm tra secrets trước khi render
+      # Bắt buộc: có đủ secrets trước khi render
       - name: Check YouTube secrets presence
         run: |
           test -n "${{ secrets.GOOGLE_CLIENT_ID }}" || (echo "Missing GOOGLE_CLIENT_ID" && exit 1)
           test -n "${{ secrets.GOOGLE_CLIENT_SECRET }}" || (echo "Missing GOOGLE_CLIENT_SECRET" && exit 1)
           test -n "${{ secrets.YT_REFRESH_TOKEN }}" || (echo "Missing YT_REFRESH_TOKEN" && exit 1)
 
-      # Xác minh token theo kiểu tokeninfo (không đòi scope đọc kênh)
+      # Xác minh token bằng tokeninfo (không cần scope đọc kênh)
       - name: Verify YouTube auth (tokeninfo)
         continue-on-error: true
         env:
@@ -124,17 +125,20 @@ jobs:
           echo "=== tokeninfo ==="
           curl -sS "https://oauth2.googleapis.com/tokeninfo?access_token=$ACCESS" | jq .
 
-      # Chạy pipeline
+      # Chạy pipeline Engine
       - name: Run pipeline (Natural Voice First)
         working-directory: engine
         env:
-          # Để Python import được 'src'
           PYTHONPATH: ${{ github.workspace }}/engine
 
-          # YouTube OAuth
+          # OAuth YouTube
           GOOGLE_CLIENT_ID: ${{ secrets.GOOGLE_CLIENT_ID }}
           GOOGLE_CLIENT_SECRET: ${{ secrets.GOOGLE_CLIENT_SECRET }}
           YT_REFRESH_TOKEN: ${{ secrets.YT_REFRESH_TOKEN }}
+
+          # BẬT chế độ Nhật + lọc bài có >= 3 ảnh
+          FEED_MODE: "JP"
+          MIN_IMAGES: "3"
 
           # Voices
           PIPER_EN_VOICE: en_US-libritts-high
@@ -180,7 +184,7 @@ jobs:
           if-no-files-found: ignore
           retention-days: 3
 
-      # Lưu state — CHỈ commit data/state.json, không add toàn repo (tránh submodule)
+      # Lưu state — CHỈ commit data/state.json (tránh add engine/ thành submodule)
       - name: Persist state (optional)
         if: always()
         run: |
@@ -192,14 +196,12 @@ jobs:
           mkdir -p data
           cp engine/data/state.json data/state.json || true
 
-          # Bảo đảm không bao giờ track thư mục engine/ & .gitmodules
+          # Không bao giờ track engine/ hay .gitmodules
           git rm -r --cached engine || true
           rm -f .gitmodules || true
 
-          # Kéo về với autoStash (nếu có thay đổi cục bộ)
+          # Kéo về (autoStash) rồi chỉ add state.json
           git -c pull.rebase=true -c rebase.autoStash=true pull || true
-
-          # Chỉ add state.json
           git add -f data/state.json || true
           git commit -m "update state [skip ci]" || echo "no changes"
           git push || true
