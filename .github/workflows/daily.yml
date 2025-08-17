@@ -28,7 +28,7 @@ jobs:
       # Kiểm tra token có quyền đọc repo Engine
       - name: Sanity check ENGINE_TOKEN can read Engine repo
         env:
-          ENGINE_REPO: tinsleigh1217650-delv/news2video-engine    # đổi nếu tên khác
+          ENGINE_REPO: tinsleigh1217650-delv/news2video-engine   # ĐỔI nếu repo engine của bạn khác
           GH_TOKEN: ${{ secrets.ENGINE_TOKEN }}
         run: |
           curl -s -H "Authorization: Bearer $GH_TOKEN" https://api.github.com/repos/$ENGINE_REPO > repo.json
@@ -44,8 +44,8 @@ jobs:
       - name: Checkout private engine
         uses: actions/checkout@v4
         with:
-          repository: tinsleigh1217650-delv/news2video-engine     # đổi nếu cần
-          token: ${{ secrets.ENGINE_TOKEN }}                      # PAT: Contents Read
+          repository: tinsleigh1217650-delv/news2video-engine   # ĐỔI nếu cần
+          token: ${{ secrets.ENGINE_TOKEN }}                    # PAT: Contents: Read
           path: engine
           ref: main
           fetch-depth: 1
@@ -97,7 +97,7 @@ jobs:
           ls -la engine/src || true
           ls -la engine/feeds || true
 
-      # Bắt buộc: có đủ secrets trước khi render
+      # BẮT BUỘC: có đủ secrets trước khi render
       - name: Check YouTube secrets presence
         run: |
           test -n "${{ secrets.GOOGLE_CLIENT_ID }}" || (echo "Missing GOOGLE_CLIENT_ID" && exit 1)
@@ -125,6 +125,15 @@ jobs:
           echo "=== tokeninfo ==="
           curl -sS "https://oauth2.googleapis.com/tokeninfo?access_token=$ACCESS" | jq .
 
+      # Vá nhẹ upload_youtube.py để đọc privacy từ YT_PRIVACY (mặc định private)
+      - name: Patch engine to respect YT_PRIVACY
+        run: |
+          set -e
+          # thay privacy="public" -> privacy=os.environ.get("YT_PRIVACY","public")
+          sed -i 's/privacy="public"/privacy=os.environ.get("YT_PRIVACY","public")/g' engine/src/upload_youtube.py || true
+          # đảm bảo có 'import os' (nếu chưa có)
+          grep -q '^import os' engine/src/upload_youtube.py || sed -i '1iimport os' engine/src/upload_youtube.py
+
       # Chạy pipeline Engine
       - name: Run pipeline (Natural Voice First)
         working-directory: engine
@@ -135,6 +144,9 @@ jobs:
           GOOGLE_CLIENT_ID: ${{ secrets.GOOGLE_CLIENT_ID }}
           GOOGLE_CLIENT_SECRET: ${{ secrets.GOOGLE_CLIENT_SECRET }}
           YT_REFRESH_TOKEN: ${{ secrets.YT_REFRESH_TOKEN }}
+
+          # Upload dạng "bản nháp" tương đương PRIVATE để bạn duyệt
+          YT_PRIVACY: "private"
 
           # BẬT chế độ Nhật + lọc bài có >= 3 ảnh
           FEED_MODE: "JP"
@@ -162,7 +174,7 @@ jobs:
 
           # Pipeline
           MAX_IMAGES: 12
-          MAX_DAILY_VIDEOS: 1
+          MAX_DAILY_VIDEOS: 1   # <= yêu cầu mới
           PICK_WINDOW: 20
         run: python run.py
 
