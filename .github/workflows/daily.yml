@@ -27,7 +27,7 @@ jobs:
       # Sanity check: token có đọc được repo ENGINE không?
       - name: Sanity check ENGINE_TOKEN can read Engine repo
         env:
-          ENGINE_REPO: luqman000193-arch/news2video-engine
+          ENGINE_REPO: tinsleigh1217650-delv/news2video-engine
           GH_TOKEN: ${{ secrets.ENGINE_TOKEN }}
         run: |
           curl -s -H "Authorization: Bearer $GH_TOKEN" https://api.github.com/repos/$ENGINE_REPO > repo.json
