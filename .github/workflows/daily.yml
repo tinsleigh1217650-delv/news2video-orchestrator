@@ -2,7 +2,7 @@ name: daily-news-to-youtube
 
 on:
   schedule:
-    - cron: "0 10 * * *"   # 17:00 VN mỗi ngày (cron theo UTC)
+    - cron: "0 10 * * *"      # 17:00 VN mỗi ngày (UTC)
   workflow_dispatch:
 
 permissions:
@@ -15,9 +15,8 @@ concurrency:
 jobs:
   build:
     runs-on: ubuntu-latest
-
     steps:
-      # Checkout Orchestrator (repo A)
+      # Repo A (orchestrator)
       - uses: actions/checkout@v4
 
       - name: Setup Python
@@ -25,52 +24,25 @@ jobs:
         with:
           python-version: "3.11"
 
-      # Kiểm tra token đọc được Engine repo (PRIVATE)
-      - name: Sanity check ENGINE_TOKEN can read Engine repo
-        env:
-          ENGINE_REPO: tinsleigh1217650-delv/news2video-engine   # ĐỔI nếu repo engine khác
-          GH_TOKEN: ${{ secrets.ENGINE_TOKEN }}
+      # ===== Secrets bắt buộc =====
+      - name: Check required secrets
         run: |
-          curl -s -H "Authorization: Bearer $GH_TOKEN" https://api.github.com/repos/$ENGINE_REPO > repo.json
-          python - <<'PY'
-          import json
-          j=json.load(open('repo.json'))
-          print("full_name:", j.get('full_name'))
-          print("private:", j.get('private'))
-          print("default_branch:", j.get('default_branch'))
-          PY
+          test -n "${{ secrets.ENGINE_TOKEN }}" || (echo "Missing ENGINE_TOKEN" && exit 1)
+          test -n "${{ secrets.GOOGLE_CLIENT_ID }}" || (echo "Missing GOOGLE_CLIENT_ID" && exit 1)
+          test -n "${{ secrets.GOOGLE_CLIENT_SECRET }}" || (echo "Missing GOOGLE_CLIENT_SECRET" && exit 1)
+          test -n "${{ secrets.YT_REFRESH_TOKEN }}" || (echo "Missing YT_REFRESH_TOKEN" && exit 1)
 
-      # Checkout Engine (repo B - PRIVATE) vào engine/
+      # Repo B (engine) – PRIVATE
       - name: Checkout private engine
         uses: actions/checkout@v4
         with:
-          repository: tinsleigh1217650-delv/news2video-engine   # ĐỔI nếu cần
+          repository: tinsleigh1217650-delv/news2video-engine   # ĐỔI nếu khác
           token: ${{ secrets.ENGINE_TOKEN }}
           path: engine
           ref: main
           fetch-depth: 1
-          submodules: false
 
-      # Cache pip / huggingface / piper
-      - name: Cache pip
-        uses: actions/cache@v4
-        with:
-          path: ~/.cache/pip
-          key: ${{ runner.os }}-pip-${{ hashFiles('engine/requirements.txt') }}
-
-      - name: Cache huggingface
-        uses: actions/cache@v4
-        with:
-          path: ~/.cache/huggingface
-          key: ${{ runner.os }}-hf-${{ hashFiles('engine/requirements.txt') }}
-
-      - name: Cache piper
-        uses: actions/cache@v4
-        with:
-          path: ~/.local/share/piper-tts
-          key: ${{ runner.os }}-piper-${{ hashFiles('engine/src/tts_piper_segments.py') }}
-
-      # System deps + Python deps
+      # Deps
       - name: Install system deps
         run: |
           sudo apt-get update
@@ -80,60 +52,44 @@ jobs:
         run: |
           pip install -r engine/requirements.txt
           pip install beautifulsoup4 feedparser lxml
-          python - <<'PY'
-          import sys
-          try:
-              import moviepy, PIL, requests, bs4, feedparser, lxml
-              print("moviepy:", moviepy.__version__)
-          except Exception as e:
-              print("PY DEPS CHECK FAILED:", e); sys.exit(1)
-          PY
 
-      # ====== Vá BOM & ép mọi nơi dùng utf-8-sig ======
-      - name: Strip BOM from jp_sources.json (surgical fix)
+      # ===== Vá BOM & ép utf-8-sig bằng Python (an toàn YAML) =====
+      - name: Normalize jp_sources.json (strip BOM)
         run: |
           python - <<'PY'
-          import json
-          p='engine/feeds/jp_sources.json'
-          data=json.load(open(p,'r',encoding='utf-8-sig'))  # nuốt BOM nếu có
-          open(p,'w',encoding='utf-8').write(json.dumps(data, ensure_ascii=False, indent=2))  # ghi lại KHÔNG BOM
+          import json, io, os, sys, glob, re
+          p = 'engine/feeds/jp_sources.json'
+          # đọc nuốt BOM
+          data = json.load(open(p, 'r', encoding='utf-8-sig'))
+          # ghi lại KHÔNG BOM
+          open(p, 'w', encoding='utf-8').write(json.dumps(data, ensure_ascii=False, indent=2))
           print("BOM stripped:", p)
+          # ép mọi nơi đọc file dùng utf-8-sig
+          for f in glob.glob('engine/**/*.py', recursive=True):
+              t = open(f, 'r', encoding='utf-8').read()
+              if 'jp_sources.json' in t:
+                  t2 = re.sub(r'open\\(([^\\)]*jp_sources\\.json[^\\)]*),\\s*[\'"]r[\'"]\\s*\\)',
+                              r'open(\\1, "r", encoding="utf-8-sig")', t)
+                  t2 = re.sub(r'open\\(([^\\)]*jp_sources\\.json[^\\)]*),\\s*encoding\\s*=\\s*[\'"]utf-8[\'"]\\s*\\)',
+                              r'open(\\1, encoding="utf-8-sig")', t2)
+                  if t2 != t:
+                      open(f, 'w', encoding='utf-8').write(t2)
+                      print("patched:", f)
           PY
 
-      - name: Force utf-8-sig in any code that reads jp_sources.json
-        run: |
-          set -e
-          files=$(grep -RIl "jp_sources.json" engine || true)
-          echo "Files referencing jp_sources.json:"
-          echo "$files"
-          for f in $files; do
-            sed -i -E 's/encoding\s*=\s*["'\'']utf-8["'\'']/encoding="utf-8-sig"/g' "$f" || true
-          done
-          echo "=== Preview lines ==="
-          grep -RInE 'jp_sources\.json|utf-8-sig' engine || true
-
-      # Debug JSON nguồn
-      - name: Debug JP sources JSON (must be valid)
+      - name: Debug sources JSON
         run: |
           echo "=== engine/feeds/jp_sources.json ==="
           cat engine/feeds/jp_sources.json
           python - <<'PY'
           import json
-          j=json.load(open('engine/feeds/jp_sources.json','r',encoding='utf-8-sig'))
+          j = json.load(open('engine/feeds/jp_sources.json','r',encoding='utf-8-sig'))
           print("sources:", len(j.get('sources',[])))
           assert len(j.get('sources',[]))>0
           PY
 
-      # BẮT BUỘC: có đủ secrets trước khi render
-      - name: Check YouTube secrets presence
-        run: |
-          test -n "${{ secrets.GOOGLE_CLIENT_ID }}" || (echo "Missing GOOGLE_CLIENT_ID" && exit 1)
-          test -n "${{ secrets.GOOGLE_CLIENT_SECRET }}" || (echo "Missing GOOGLE_CLIENT_SECRET" && exit 1)
-          test -n "${{ secrets.YT_REFRESH_TOKEN }}" || (echo "Missing YT_REFRESH_TOKEN" && exit 1)
-          test -n "${{ secrets.ENGINE_TOKEN }}" || (echo "Missing ENGINE_TOKEN" && exit 1)
-
-      # Verify YouTube auth (tokeninfo)
-      - name: Verify YouTube auth (tokeninfo)
+      # (Tuỳ chọn) kiểm tra token YT
+      - name: Verify YouTube token (optional)
         continue-on-error: true
         env:
           CLIENT_ID: ${{ secrets.GOOGLE_CLIENT_ID }}
@@ -147,14 +103,15 @@ jobs:
             -d refresh_token="$REFRESH_TOKEN" \
             -d grant_type=refresh_token)
           ACCESS=$(echo "$RESP" | jq -r '.access_token // empty')
-          if [ -z "$ACCESS" ]; then
-            echo "WARN: cannot refresh access token now"; exit 0
+          if [ -n "$ACCESS" ]; then
+            echo "=== tokeninfo ==="
+            curl -sS "https://oauth2.googleapis.com/tokeninfo?access_token=$ACCESS" | jq .
+          else
+            echo "WARN: cannot get access token now"
           fi
-          echo "=== tokeninfo ==="
-          curl -sS "https://oauth2.googleapis.com/tokeninfo?access_token=$ACCESS" | jq .
 
-      # === PREFLIGHT: phải có >= 1 bài hợp lệ (>=3 ảnh) ===
-      - name: Preflight JP sources (must find >=1 article with >=3 images)
+      # Preflight phải tìm thấy >=1 bài có >=3 ảnh
+      - name: Preflight JP feed (>=3 images)
         working-directory: engine
         env:
           PYTHONPATH: ${{ github.workspace }}/engine
@@ -163,26 +120,26 @@ jobs:
         run: |
           python tools/preflight_jp.py
 
-      # Chạy pipeline Engine (CHỈ khi preflight OK)
-      - name: Run pipeline (Natural Voice First)
+      # Chạy pipeline
+      - name: Run pipeline
         working-directory: engine
         env:
           PYTHONPATH: ${{ github.workspace }}/engine
 
-          # OAuth YouTube
+          # YouTube OAuth
           GOOGLE_CLIENT_ID: ${{ secrets.GOOGLE_CLIENT_ID }}
           GOOGLE_CLIENT_SECRET: ${{ secrets.GOOGLE_CLIENT_SECRET }}
           YT_REFRESH_TOKEN: ${{ secrets.YT_REFRESH_TOKEN }}
 
-          # Upload private để duyệt
+          # Upload private (bản nháp)
           YT_PRIVACY: "private"
 
-          # Nhật + yêu cầu >= 3 ảnh, chặn fallback
+          # Nhật + yêu cầu ảnh
           FEED_MODE: "JP"
           MIN_IMAGES: "3"
           ALLOW_FALLBACK: "0"
 
-          # Voices & audio
+          # Voice & audio
           PIPER_EN_VOICE: en_US-libritts-high
           PIPER_HOST_VOICE: en_US-lessac-medium
           AUTO_LENGTH_SCALE: "false"
@@ -202,17 +159,16 @@ jobs:
           PICK_WINDOW: 20
         run: python run.py
 
-      # GUARD: nếu còn rơi NASA thì fail để tránh video đen
-      - name: Guard: fail if NASA fallback used
+      # Chặn fallback NASA => fail sớm để khỏi up video đen
+      - name: Guard NASA fallback
         if: always()
         run: |
-          set -e
           if find engine/output -maxdepth 2 -type d -name "nasa-developed-printable-metal-can-take-the-heat" | grep -q .; then
-            echo "::error::NASA fallback detected -> failing job to avoid black video."
+            echo "::error::NASA fallback detected -> failing job."
             exit 1
           fi
 
-      # Thu thập artifact (debug)
+      # Artifacts để bạn kiểm tra
       - name: List outputs
         if: always()
         run: |
@@ -232,7 +188,7 @@ jobs:
           if-no-files-found: ignore
           retention-days: 3
 
-      # Chỉ commit state.json
+      # Lưu state (nếu có)
       - name: Persist state (optional)
         if: always()
         run: |
@@ -242,9 +198,6 @@ jobs:
           git config user.name "news-bot"
           mkdir -p data
           cp engine/data/state.json data/state.json || true
-          git rm -r --cached engine || true
-          rm -f .gitmodules || true
-          git -c pull.rebase=true -c rebase.autoStash=true pull || true
           git add -f data/state.json || true
           git commit -m "update state [skip ci]" || echo "no changes"
           git push || true
