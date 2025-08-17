@@ -43,7 +43,7 @@ jobs:
       - name: Checkout private engine
         uses: actions/checkout@v4
         with:
-          repository: luqman000193-arch/news2video-engine
+          repository: tinsleigh1217650-delv/news2video-engine
           token: ${{ secrets.ENGINE_TOKEN }}   # PAT: Contents: Read
           path: engine
           ref: main
