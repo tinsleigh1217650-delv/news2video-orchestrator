@@ -2,7 +2,7 @@ name: daily-news-to-youtube
 
 on:
   schedule:
-    - cron: "0 10 * * *"   # 17:00 VN mỗi ngày
+    - cron: "0 10 * * *"   # 17:00 VN mỗi ngày (cron theo UTC)
   workflow_dispatch:
 
 permissions:
@@ -25,7 +25,7 @@ jobs:
         with:
           python-version: "3.11"
 
-      # Sanity: token có quyền đọc repo Engine
+      # Kiểm tra token đọc được Engine repo (PRIVATE)
       - name: Sanity check ENGINE_TOKEN can read Engine repo
         env:
           ENGINE_REPO: tinsleigh1217650-delv/news2video-engine   # ĐỔI nếu repo engine khác
@@ -107,13 +107,12 @@ jobs:
           echo "Files referencing jp_sources.json:"
           echo "$files"
           for f in $files; do
-            # thay mọi 'encoding="utf-8"' thành 'encoding="utf-8-sig"' trong file đó
             sed -i -E 's/encoding\s*=\s*["'\'']utf-8["'\'']/encoding="utf-8-sig"/g' "$f" || true
           done
           echo "=== Preview lines ==="
           grep -RInE 'jp_sources\.json|utf-8-sig' engine || true
 
-      # Debug cây file + JSON nguồn
+      # Debug JSON nguồn
       - name: Debug JP sources JSON (must be valid)
         run: |
           echo "=== engine/feeds/jp_sources.json ==="
@@ -131,6 +130,7 @@ jobs:
           test -n "${{ secrets.GOOGLE_CLIENT_ID }}" || (echo "Missing GOOGLE_CLIENT_ID" && exit 1)
           test -n "${{ secrets.GOOGLE_CLIENT_SECRET }}" || (echo "Missing GOOGLE_CLIENT_SECRET" && exit 1)
           test -n "${{ secrets.YT_REFRESH_TOKEN }}" || (echo "Missing YT_REFRESH_TOKEN" && exit 1)
+          test -n "${{ secrets.ENGINE_TOKEN }}" || (echo "Missing ENGINE_TOKEN" && exit 1)
 
       # Verify YouTube auth (tokeninfo)
       - name: Verify YouTube auth (tokeninfo)
