@@ -15,7 +15,9 @@ concurrency:
 jobs:
   build:
     runs-on: ubuntu-latest
+
     steps:
+      # Checkout Orchestrator (repo A)
       - uses: actions/checkout@v4
 
       - name: Setup Python
@@ -23,9 +25,10 @@ jobs:
         with:
           python-version: "3.11"
 
+      # Sanity: token có quyền đọc repo Engine
       - name: Sanity check ENGINE_TOKEN can read Engine repo
         env:
-          ENGINE_REPO: tinsleigh1217650-delv/news2video-engine   # đổi nếu khác
+          ENGINE_REPO: tinsleigh1217650-delv/news2video-engine   # ĐỔI nếu repo engine khác
           GH_TOKEN: ${{ secrets.ENGINE_TOKEN }}
         run: |
           curl -s -H "Authorization: Bearer $GH_TOKEN" https://api.github.com/repos/$ENGINE_REPO > repo.json
@@ -37,16 +40,18 @@ jobs:
           print("default_branch:", j.get('default_branch'))
           PY
 
+      # Checkout Engine (repo B - PRIVATE) vào engine/
       - name: Checkout private engine
         uses: actions/checkout@v4
         with:
-          repository: tinsleigh1217650-delv/news2video-engine
+          repository: tinsleigh1217650-delv/news2video-engine   # ĐỔI nếu cần
           token: ${{ secrets.ENGINE_TOKEN }}
           path: engine
           ref: main
           fetch-depth: 1
           submodules: false
 
+      # Cache pip / huggingface / piper
       - name: Cache pip
         uses: actions/cache@v4
         with:
@@ -65,6 +70,7 @@ jobs:
           path: ~/.local/share/piper-tts
           key: ${{ runner.os }}-piper-${{ hashFiles('engine/src/tts_piper_segments.py') }}
 
+      # System deps + Python deps
       - name: Install system deps
         run: |
           sudo apt-get update
@@ -83,14 +89,31 @@ jobs:
               print("PY DEPS CHECK FAILED:", e); sys.exit(1)
           PY
 
-      - name: Debug list files
+      # ====== Vá BOM & ép mọi nơi dùng utf-8-sig ======
+      - name: Strip BOM from jp_sources.json (surgical fix)
         run: |
-          pwd
-          ls -la
-          ls -la engine || true
-          ls -la engine/src || true
-          ls -la engine/feeds || true
+          python - <<'PY'
+          import json
+          p='engine/feeds/jp_sources.json'
+          data=json.load(open(p,'r',encoding='utf-8-sig'))  # nuốt BOM nếu có
+          open(p,'w',encoding='utf-8').write(json.dumps(data, ensure_ascii=False, indent=2))  # ghi lại KHÔNG BOM
+          print("BOM stripped:", p)
+          PY
 
+      - name: Force utf-8-sig in any code that reads jp_sources.json
+        run: |
+          set -e
+          files=$(grep -RIl "jp_sources.json" engine || true)
+          echo "Files referencing jp_sources.json:"
+          echo "$files"
+          for f in $files; do
+            # thay mọi 'encoding="utf-8"' thành 'encoding="utf-8-sig"' trong file đó
+            sed -i -E 's/encoding\s*=\s*["'\'']utf-8["'\'']/encoding="utf-8-sig"/g' "$f" || true
+          done
+          echo "=== Preview lines ==="
+          grep -RInE 'jp_sources\.json|utf-8-sig' engine || true
+
+      # Debug cây file + JSON nguồn
       - name: Debug JP sources JSON (must be valid)
         run: |
           echo "=== engine/feeds/jp_sources.json ==="
@@ -102,12 +125,14 @@ jobs:
           assert len(j.get('sources',[]))>0
           PY
 
+      # BẮT BUỘC: có đủ secrets trước khi render
       - name: Check YouTube secrets presence
         run: |
           test -n "${{ secrets.GOOGLE_CLIENT_ID }}" || (echo "Missing GOOGLE_CLIENT_ID" && exit 1)
           test -n "${{ secrets.GOOGLE_CLIENT_SECRET }}" || (echo "Missing GOOGLE_CLIENT_SECRET" && exit 1)
           test -n "${{ secrets.YT_REFRESH_TOKEN }}" || (echo "Missing YT_REFRESH_TOKEN" && exit 1)
 
+      # Verify YouTube auth (tokeninfo)
       - name: Verify YouTube auth (tokeninfo)
         continue-on-error: true
         env:
@@ -128,6 +153,7 @@ jobs:
           echo "=== tokeninfo ==="
           curl -sS "https://oauth2.googleapis.com/tokeninfo?access_token=$ACCESS" | jq .
 
+      # === PREFLIGHT: phải có >= 1 bài hợp lệ (>=3 ảnh) ===
       - name: Preflight JP sources (must find >=1 article with >=3 images)
         working-directory: engine
         env:
@@ -137,11 +163,13 @@ jobs:
         run: |
           python tools/preflight_jp.py
 
+      # Chạy pipeline Engine (CHỈ khi preflight OK)
       - name: Run pipeline (Natural Voice First)
         working-directory: engine
         env:
           PYTHONPATH: ${{ github.workspace }}/engine
 
+          # OAuth YouTube
           GOOGLE_CLIENT_ID: ${{ secrets.GOOGLE_CLIENT_ID }}
           GOOGLE_CLIENT_SECRET: ${{ secrets.GOOGLE_CLIENT_SECRET }}
           YT_REFRESH_TOKEN: ${{ secrets.YT_REFRESH_TOKEN }}
@@ -149,7 +177,7 @@ jobs:
           # Upload private để duyệt
           YT_PRIVACY: "private"
 
-          # Chế độ Nhật + yêu cầu >= 3 ảnh
+          # Nhật + yêu cầu >= 3 ảnh, chặn fallback
           FEED_MODE: "JP"
           MIN_IMAGES: "3"
           ALLOW_FALLBACK: "0"
@@ -174,6 +202,17 @@ jobs:
           PICK_WINDOW: 20
         run: python run.py
 
+      # GUARD: nếu còn rơi NASA thì fail để tránh video đen
+      - name: Guard: fail if NASA fallback used
+        if: always()
+        run: |
+          set -e
+          if find engine/output -maxdepth 2 -type d -name "nasa-developed-printable-metal-can-take-the-heat" | grep -q .; then
+            echo "::error::NASA fallback detected -> failing job to avoid black video."
+            exit 1
+          fi
+
+      # Thu thập artifact (debug)
       - name: List outputs
         if: always()
         run: |
@@ -193,6 +232,7 @@ jobs:
           if-no-files-found: ignore
           retention-days: 3
 
+      # Chỉ commit state.json
       - name: Persist state (optional)
         if: always()
         run: |
