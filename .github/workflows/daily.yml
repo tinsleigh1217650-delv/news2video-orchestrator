@@ -25,10 +25,10 @@ jobs:
         with:
           python-version: "3.11"
 
-      # Kiểm tra token có quyền đọc repo Engine
+      # Sanity: token có quyền đọc repo Engine
       - name: Sanity check ENGINE_TOKEN can read Engine repo
         env:
-          ENGINE_REPO: tinsleigh1217650-delv/news2video-engine   # ĐỔI nếu repo engine của bạn khác
+          ENGINE_REPO: tinsleigh1217650-delv/news2video-engine   # ĐỔI nếu repo engine khác
           GH_TOKEN: ${{ secrets.ENGINE_TOKEN }}
         run: |
           curl -s -H "Authorization: Bearer $GH_TOKEN" https://api.github.com/repos/$ENGINE_REPO > repo.json
@@ -40,12 +40,12 @@ jobs:
           print("default_branch:", j.get('default_branch'))
           PY
 
-      # Checkout Engine (repo B - PRIVATE) vào thư mục engine/
+      # Checkout Engine (repo B - PRIVATE) vào engine/
       - name: Checkout private engine
         uses: actions/checkout@v4
         with:
           repository: tinsleigh1217650-delv/news2video-engine   # ĐỔI nếu cần
-          token: ${{ secrets.ENGINE_TOKEN }}                    # PAT: Contents: Read
+          token: ${{ secrets.ENGINE_TOKEN }}
           path: engine
           ref: main
           fetch-depth: 1
@@ -79,16 +79,18 @@ jobs:
       - name: Install Python deps
         run: |
           pip install -r engine/requirements.txt
+          # đảm bảo bs4/feedparser/lxml có mặt
+          pip install beautifulsoup4 feedparser lxml
           python - <<'PY'
           import sys
           try:
-              import moviepy, PIL, requests
+              import moviepy, PIL, requests, bs4, feedparser, lxml
               print("moviepy:", moviepy.__version__)
           except Exception as e:
               print("PY DEPS CHECK FAILED:", e); sys.exit(1)
           PY
 
-      # (debug nhẹ)
+      # Debug cây file + JSON nguồn
       - name: Debug list files
         run: |
           pwd
@@ -97,6 +99,17 @@ jobs:
           ls -la engine/src || true
           ls -la engine/feeds || true
 
+      - name: Debug JP sources JSON (must be valid)
+        run: |
+          echo "=== engine/feeds/jp_sources.json ==="
+          cat engine/feeds/jp_sources.json
+          python - <<'PY'
+          import json,sys
+          j=json.load(open('engine/feeds/jp_sources.json','r',encoding='utf-8'))
+          print("sources:", len(j.get('sources',[])))
+          assert len(j.get('sources',[]))>0
+          PY
+
       # BẮT BUỘC: có đủ secrets trước khi render
       - name: Check YouTube secrets presence
         run: |
@@ -104,7 +117,7 @@ jobs:
           test -n "${{ secrets.GOOGLE_CLIENT_SECRET }}" || (echo "Missing GOOGLE_CLIENT_SECRET" && exit 1)
           test -n "${{ secrets.YT_REFRESH_TOKEN }}" || (echo "Missing YT_REFRESH_TOKEN" && exit 1)
 
-      # Xác minh token bằng tokeninfo (không cần scope đọc kênh)
+      # Verify YouTube auth (tokeninfo)
       - name: Verify YouTube auth (tokeninfo)
         continue-on-error: true
         env:
@@ -125,16 +138,24 @@ jobs:
           echo "=== tokeninfo ==="
           curl -sS "https://oauth2.googleapis.com/tokeninfo?access_token=$ACCESS" | jq .
 
-      # Vá nhẹ upload_youtube.py để đọc privacy từ YT_PRIVACY (mặc định private)
+      # Vá nhẹ upload_youtube.py để đọc privacy từ env
       - name: Patch engine to respect YT_PRIVACY
         run: |
           set -e
-          # thay privacy="public" -> privacy=os.environ.get("YT_PRIVACY","public")
           sed -i 's/privacy="public"/privacy=os.environ.get("YT_PRIVACY","public")/g' engine/src/upload_youtube.py || true
-          # đảm bảo có 'import os' (nếu chưa có)
           grep -q '^import os' engine/src/upload_youtube.py || sed -i '1iimport os' engine/src/upload_youtube.py
 
-      # Chạy pipeline Engine
+      # === PREFLIGHT: BẮT BUỘC phải có >= 1 bài hợp lệ (>=3 ảnh) ===
+      - name: Preflight JP sources (must find >=1 article with >=3 images)
+        working-directory: engine
+        env:
+          PYTHONPATH: ${{ github.workspace }}/engine
+          FEED_MODE: "JP"
+          MIN_IMAGES: "3"
+        run: |
+          python tools/preflight_jp.py
+
+      # Chạy pipeline Engine (CHỈ khi preflight OK)
       - name: Run pipeline (Natural Voice First)
         working-directory: engine
         env:
@@ -151,6 +172,9 @@ jobs:
           # BẬT chế độ Nhật + lọc bài có >= 3 ảnh
           FEED_MODE: "JP"
           MIN_IMAGES: "3"
+
+          # Tắt mọi fallback nội bộ (nếu code bạn có hỗ trợ)
+          ALLOW_FALLBACK: "0"
 
           # Voices
           PIPER_EN_VOICE: en_US-libritts-high
@@ -174,15 +198,16 @@ jobs:
 
           # Pipeline
           MAX_IMAGES: 12
-          MAX_DAILY_VIDEOS: 1   # <= yêu cầu mới
+          MAX_DAILY_VIDEOS: 1
           PICK_WINDOW: 20
         run: python run.py
 
       # Thu thập artifact (debug)
       - name: List outputs
+        if: always()
         run: |
           echo "=== OUTPUT TREE ==="
-          find engine/output -maxdepth 3 -type f \( -name "video.mp4" -o -name "thumbnail.jpg" -o -name "*.srt" \) -print || true
+          find engine/output -maxdepth 3 -type f \( -name "video.mp4" -o -name "thumbnail.jpg" -o -name "*.srt" -o -name "img_*.jpg" \) -print || true
 
       - name: Upload artifacts (debug)
         if: always()
@@ -193,10 +218,11 @@ jobs:
             engine/output/**/video.mp4
             engine/output/**/thumbnail.jpg
             engine/output/**/subs.srt
+            engine/output/**/img_*.jpg
           if-no-files-found: ignore
           retention-days: 3
 
-      # Lưu state — CHỈ commit data/state.json (tránh add engine/ thành submodule)
+      # Chỉ commit state.json
       - name: Persist state (optional)
         if: always()
         run: |
@@ -208,11 +234,9 @@ jobs:
           mkdir -p data
           cp engine/data/state.json data/state.json || true
 
-          # Không bao giờ track engine/ hay .gitmodules
           git rm -r --cached engine || true
           rm -f .gitmodules || true
 
-          # Kéo về (autoStash) rồi chỉ add state.json
           git -c pull.rebase=true -c rebase.autoStash=true pull || true
           git add -f data/state.json || true
           git commit -m "update state [skip ci]" || echo "no changes"
