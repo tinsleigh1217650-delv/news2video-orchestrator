@@ -1,0 +1,206 @@
+name: daily-news-to-youtube
+
+on:
+  schedule:
+    - cron: "0 10 * * *"   # 17:00 giờ VN mỗi ngày
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: news2video-daily
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      # Checkout Orchestrator (repo A - chính nó)
+      - uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      # Sanity check: token có đọc được repo ENGINE không?
+      - name: Sanity check ENGINE_TOKEN can read Engine repo
+        env:
+          ENGINE_REPO: luqman000193-arch/news2video-engine
+          GH_TOKEN: ${{ secrets.ENGINE_TOKEN }}
+        run: |
+          curl -s -H "Authorization: Bearer $GH_TOKEN" https://api.github.com/repos/$ENGINE_REPO > repo.json
+          python - <<'PY'
+          import json
+          j=json.load(open('repo.json'))
+          print("full_name:", j.get('full_name'))
+          print("private:", j.get('private'))
+          print("default_branch:", j.get('default_branch'))
+          PY
+
+      # Checkout ENGINE (Repo B - Private) vào thư mục engine/
+      - name: Checkout private engine
+        uses: actions/checkout@v4
+        with:
+          repository: luqman000193-arch/news2video-engine
+          token: ${{ secrets.ENGINE_TOKEN }}   # PAT: Contents: Read
+          path: engine
+          ref: main
+          fetch-depth: 1
+          submodules: false
+
+      # Cache pip theo requirements của Engine
+      - name: Cache pip
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-${{ hashFiles('engine/requirements.txt') }}
+
+      # (tuỳ chọn) Cache huggingface
+      - name: Cache huggingface
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/huggingface
+          key: ${{ runner.os }}-hf-${{ hashFiles('engine/requirements.txt') }}
+
+      # (tuỳ chọn) Cache Piper (binary + voices)
+      - name: Cache piper
+        uses: actions/cache@v4
+        with:
+          path: ~/.local/share/piper-tts
+          key: ${{ runner.os }}-piper-${{ hashFiles('engine/src/tts_piper_segments.py') }}
+
+      - name: Install system deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg espeak jq
+
+      - name: Install Python deps
+        run: |
+          pip install -r engine/requirements.txt
+          python - <<'PY'
+          import sys
+          try:
+              import moviepy, PIL, requests
+              print("moviepy:", moviepy.__version__)
+          except Exception as e:
+              print("PY DEPS CHECK FAILED:", e); sys.exit(1)
+          PY
+
+      # DEBUG: xem feeds & picks
+      - name: Debug show feeds file
+        run: |
+          echo "=== engine/feeds/allowed_sources.txt ==="
+          cat engine/feeds/allowed_sources.txt || true
+
+      - name: Debug pull feeds
+        working-directory: engine
+        run: |
+          echo "=== curl NASA RSS (first 20 lines) ==="
+          curl -s https://www.nasa.gov/rss/dyn/breaking_news.rss | head -n 20 || true
+          echo "=== python src/pull_feeds.py (picks) ==="
+          python src/pull_feeds.py || true
+
+      - name: Debug list files
+        run: |
+          pwd
+          ls -la
+          ls -la engine || true
+          ls -la engine/src || true
+
+      # ✅ Verify YouTube token bằng tokeninfo (in scope/expiry, không cần quyền đọc kênh)
+      - name: Verify YouTube auth (tokeninfo)
+        continue-on-error: true
+        env:
+          CLIENT_ID: ${{ secrets.GOOGLE_CLIENT_ID }}
+          CLIENT_SECRET: ${{ secrets.GOOGLE_CLIENT_SECRET }}
+          REFRESH_TOKEN: ${{ secrets.YT_REFRESH_TOKEN }}
+        run: |
+          set -e
+          RESP=$(curl -sS -X POST https://oauth2.googleapis.com/token \
+            -d client_id="$CLIENT_ID" \
+            -d client_secret="$CLIENT_SECRET" \
+            -d refresh_token="$REFRESH_TOKEN" \
+            -d grant_type=refresh_token)
+          ACCESS=$(echo "$RESP" | jq -r '.access_token // empty')
+          if [ -z "$ACCESS" ]; then
+            echo "WARN: cannot refresh access token now"; exit 0
+          fi
+          echo "=== tokeninfo ==="
+          curl -sS "https://oauth2.googleapis.com/tokeninfo?access_token=$ACCESS" | jq .
+
+      # Chạy pipeline
+      - name: Run pipeline (Natural Voice First)
+        working-directory: engine
+        env:
+          # để Python import được 'src'
+          PYTHONPATH: ${{ github.workspace }}/engine
+
+          # YouTube OAuth
+          GOOGLE_CLIENT_ID: ${{ secrets.GOOGLE_CLIENT_ID }}
+          GOOGLE_CLIENT_SECRET: ${{ secrets.GOOGLE_CLIENT_SECRET }}
+          YT_REFRESH_TOKEN: ${{ secrets.YT_REFRESH_TOKEN }}
+
+          # Voices
+          PIPER_EN_VOICE: en_US-libritts-high
+          PIPER_HOST_VOICE: en_US-lessac-medium
+
+          # Natural pacing
+          AUTO_LENGTH_SCALE: "false"
+          PIPER_LENGTH_SCALE_BASE: "1.02"
+          HOST_LENGTH_SCALE: "1.06"
+
+          # Pauses
+          PAUSE_AFTER_INTRO: "0.6"
+          PAUSE_BETWEEN_SEGS: "0.35"
+
+          # Audio polish
+          LOUDNORM_I: "-14"
+          LOUDNORM_TP: "-1.5"
+          LOUDNORM_LRA: "11"
+          USE_DEESSER: "true"
+          MUSIC_BED_DB: "-28"
+
+          # Pipeline
+          MAX_IMAGES: 12
+          MAX_DAILY_VIDEOS: 1
+          PICK_WINDOW: 20
+        run: python run.py
+
+      # Thu thập artifact để tải về nếu upload lỗi
+      - name: List outputs
+        run: |
+          echo "=== OUTPUT TREE ==="
+          find engine/output -maxdepth 3 -type f \( -name "video.mp4" -o -name "thumbnail.jpg" -o -name "*.srt" \) -print || true
+
+      - name: Upload artifacts (debug)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: outputs-debug
+          path: |
+            engine/output/**/video.mp4
+            engine/output/**/thumbnail.jpg
+            engine/output/**/subs.srt
+          if-no-files-found: ignore
+          retention-days: 3
+
+      # Lưu state (chống đăng trùng) — autoStash để không lỗi rebase
+      - name: Persist state (optional)
+        if: always()
+        run: |
+          set -e
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          git config user.email "bot@users.noreply.github.com"
+          git config user.name "news-bot"
+
+          mkdir -p data
+          cp engine/data/state.json data/state.json || true
+
+          git add -A
+          git -c pull.rebase=true -c rebase.autoStash=true pull || true
+
+          git add data/state.json || true
+          git commit -m "update state [skip ci]" || echo "no changes"
+          git push || true
